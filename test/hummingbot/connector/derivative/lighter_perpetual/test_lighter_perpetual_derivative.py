@@ -1515,7 +1515,122 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self.assertTrue(
             any(
                 record.levelname == "WARNING"
-                and record.getMessage().startswith(f"Failed to fetch fills for filled order {order.client_order_id}.")
+                and record.getMessage().startswith(f"Failed to fetch fills for order {order.client_order_id}.")
                 for record in self.log_records
             )
         )
+
+    def _older_foreign_trade(self, trade_id: str, seconds_before: int) -> dict:
+        trade = self._foreign_trade(trade_id)
+        trade["transaction_time"] = (1640780000 - seconds_before) * 1_000_000
+        return trade
+
+    @aioresponses()
+    async def test_all_trade_updates_for_order_pages_back_to_older_fills(self, mock_api):
+        # More than 100 newer trades on the account push the order's fill onto the second page.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        first_page = [self._foreign_trade(str(1000 + i)) for i in range(100)]
+        mock_api.get(self._account_trades_url(), body=json.dumps({"trades": first_page, "next_cursor": "page-2"}))
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({
+                "trades": [self._own_fill(order, "61", "1", "10004"), self._foreign_trade("62")],
+                "next_cursor": "page-3",
+            }),
+        )
+
+        trade_updates = await self.exchange._all_trade_updates_for_order(order=order)
+
+        self.assertEqual(["61"], [update.trade_id for update in trade_updates])
+        requests = self._all_executed_requests(mock_api, self._account_trades_url())
+        self.assertEqual(2, len(requests))
+        self.assertNotIn("cursor", requests[0].kwargs["params"])
+        self.assertEqual("page-2", requests[1].kwargs["params"]["cursor"])
+
+    @aioresponses()
+    async def test_all_trade_updates_for_order_stops_at_trades_older_than_the_order(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({
+                "trades": [self._foreign_trade("71"), self._older_foreign_trade("72", seconds_before=3600)],
+                "next_cursor": "page-2",
+            }),
+            repeat=True,
+        )
+
+        trade_updates = await self.exchange._all_trade_updates_for_order(order=order)
+
+        self.assertEqual([], trade_updates)
+        self.assertEqual(1, len(self._all_executed_requests(mock_api, self._account_trades_url())))
+
+    @aioresponses()
+    async def test_all_trade_updates_for_order_warns_when_page_limit_is_reached(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({
+                "trades": [self._foreign_trade(str(2000 + i)) for i in range(100)],
+                "next_cursor": "more",
+            }),
+            repeat=True,
+        )
+
+        trade_updates = await self.exchange._all_trade_updates_for_order(order=order)
+
+        self.assertEqual([], trade_updates)
+        self.assertEqual(
+            self.exchange.ORDER_FILLS_MAX_PAGES,
+            len(self._all_executed_requests(mock_api, self._account_trades_url())),
+        )
+        self.assertTrue(
+            any(
+                record.levelname == "WARNING"
+                and record.getMessage().startswith(f"Stopped looking for fills of order {order.client_order_id}")
+                for record in self.log_records
+            )
+        )
+
+    @aioresponses()
+    async def test_filled_status_requests_fills_filtered_by_order_index(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({"trades": [self._own_fill(order, "81", "1", "10002")]}),
+        )
+        payload = self._inactive_order_payload(order, "filled")
+        payload["orders"][0]["order_index"] = 281475000000123
+        self._mock_active(mock_api, {"orders": []})
+        self._mock_inactive(mock_api, payload)
+
+        order_update = await self.exchange._request_order_status(tracked_order=order)
+
+        self.assertEqual(OrderState.FILLED, order_update.new_state)
+        self.assertEqual(Decimal("1"), order.executed_amount_base)
+        request = self._all_executed_requests(mock_api, self._account_trades_url())[0]
+        self.assertEqual(281475000000123, request.kwargs["params"]["order_index"])
+
+    @aioresponses()
+    async def test_canceled_order_with_partial_fill_gets_its_fills_before_closing(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({"trades": [self._own_fill(order, "91", "0.4", "10001")]}),
+        )
+        self._mock_active(mock_api, {"orders": []})
+        self._mock_inactive(mock_api, self._inactive_order_payload(order, "canceled-too-much-slippage", filled="0.4"))
+
+        order_update = await self.exchange._request_order_status(tracked_order=order)
+
+        self.assertEqual(OrderState.FAILED, order_update.new_state)
+        self.assertEqual(Decimal("0.4"), order.executed_amount_base)
