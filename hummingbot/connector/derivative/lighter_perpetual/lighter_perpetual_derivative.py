@@ -391,20 +391,50 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             for order in self._order_tracker.all_fillable_orders.values()
         }
         for market_id in market_ids:
-            response = await self._api_get(
-                path_url=CONSTANTS.RECENT_TRADES_PATH_URL,
-                params={
-                    "market_id": market_id,
-                    "limit": 100,
-                },
-            )
-            for trade in response.get("trades", []):
+            for trade in await self._request_account_trades(market_id=market_id):
                 trade_update = self._trade_update_from_trade(trade)
                 if trade_update is not None:
                     self._order_tracker.process_trade_update(trade_update)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        return []
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(order.trading_pair)
+        trade_updates = []
+        for trade in await self._request_account_trades(market_id=market.market_id):
+            trade_update = self._trade_update_from_trade(trade)
+            if trade_update is not None and trade_update.client_order_id == order.client_order_id:
+                trade_updates.append(trade_update)
+        return trade_updates
+
+    async def _process_missing_fills(self, tracked_order: InFlightOrder):
+        # The order reached FILLED but its fills haven't been applied yet, e.g. it filled after this
+        # cycle's trade history read. Fetch them now so the order tracker doesn't time out waiting
+        # for them and close the order with a zero executed amount.
+        try:
+            for trade_update in await self._all_trade_updates_for_order(order=tracked_order):
+                self._order_tracker.process_trade_update(trade_update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as request_error:
+            self.logger().warning(
+                f"Failed to fetch fills for filled order {tracked_order.client_order_id}. Error: {request_error}"
+            )
+
+    async def _request_account_trades(self, market_id: int) -> List[Dict[str, Any]]:
+        # Query the account's own fills rather than the public market tape: on liquid markets the
+        # last 100 public trades only cover a few seconds, so our fills fall out of that window
+        # long before the next polling cycle.
+        response = await self._api_get(
+            path_url=CONSTANTS.TRADES_PATH_URL,
+            params={
+                "account_index": self._account_index,
+                "market_id": market_id,
+                "sort_by": "timestamp",
+                "limit": 100,
+            },
+            is_auth_required=True,
+        )
+        return response.get("trades", [])
 
     @staticmethod
     def _order_misc_updates(order_data: Dict[str, Any], state: OrderState) -> Optional[Dict[str, Any]]:
@@ -435,6 +465,8 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 )
             raise IOError(f"{CONSTANTS.ORDER_NOT_EXIST_MESSAGE}: {tracked_order.client_order_id}")
         new_state = order_state_from_order_data(order_data)
+        if new_state == OrderState.FILLED and not tracked_order.is_done:
+            await self._process_missing_fills(tracked_order)
         return OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=normalize_timestamp_to_seconds(
