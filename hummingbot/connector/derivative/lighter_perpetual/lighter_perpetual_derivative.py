@@ -419,9 +419,20 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         filled_amount = Decimal("0")
         cursor = None
         for _ in range(self.ORDER_FILLS_MAX_PAGES):
-            response = await self._request_account_trades(
-                market_id=market.market_id, order_index=order_index, cursor=cursor
-            )
+            try:
+                response = await self._request_account_trades(
+                    market_id=market.market_id, order_index=order_index, cursor=cursor
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                if cursor is None:
+                    raise
+                # Keep the fills already found on earlier pages rather than dropping them.
+                self.logger().warning(
+                    f"Failed to fetch more fills for order {order.client_order_id}. Error: {request_error}"
+                )
+                return trade_updates
             trades = response.get("trades", [])
             reached_older_trades = False
             for trade in trades:

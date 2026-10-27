@@ -1634,3 +1634,25 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
 
         self.assertEqual(OrderState.FAILED, order_update.new_state)
         self.assertEqual(Decimal("0.4"), order.executed_amount_base)
+
+    @aioresponses()
+    async def test_all_trade_updates_for_order_keeps_fills_found_before_a_page_fails(self, mock_api):
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_buy_market_order()
+
+        mock_api.get(
+            self._account_trades_url(),
+            body=json.dumps({"trades": [self._own_fill(order, "95", "0.4", "10000")], "next_cursor": "page-2"}),
+        )
+        mock_api.get(self._account_trades_url(), status=500)
+
+        trade_updates = await self.exchange._all_trade_updates_for_order(order=order)
+
+        self.assertEqual(["95"], [update.trade_id for update in trade_updates])
+        self.assertTrue(
+            any(
+                record.levelname == "WARNING"
+                and record.getMessage().startswith(f"Failed to fetch more fills for order {order.client_order_id}.")
+                for record in self.log_records
+            )
+        )
